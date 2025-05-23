@@ -64,7 +64,7 @@ def load_model(model_path, device_map="auto", torch_dtype=torch.float16):
 def main():
     # 定义模型路径
     model_path = "/raid_sdh/home/xyg/PRETRAINED_MODEL/Llama-3-8B"
-    device = setup_environment(0)
+    device = setup_environment(2)
     # 调用加载模型方法
     model,tokenizer = load_model(model_path,device_map=device)
 
@@ -86,29 +86,30 @@ def main():
     compressor_config = CompressorConfig(
         input_dim=head_dim*kv_head_num, 
         reduction_factor=4, 
-        output_seq_len=8, 
+        output_seq_len=4, 
         num_attention_heads=kv_head_num, 
         use_mixed_precision=True,
         kv_head_dim=kv_head_num,
         layer_nums = num_layers,
-        compress_layers = [],
         torch_dtype=torch.bfloat16
         )
     processor = CacheProcessor(config=compressor_config)
-    compressor_k = KVCompressor(config=compressor_config).to(input_tokens['input_ids'].device)
-    compressor_v = KVCompressor(config=compressor_config).to(input_tokens['input_ids'].device)
+    target_device = input_tokens['input_ids'].device
+    target_dtype = compressor_config.torch_dtype
 
-    # 处理张量
-    processed_keys = processor(cache.key_cache)
-    processed_values = processor(cache.value_cache)
-    logging.debug(f"拼接后的缓存形状：{processed_keys.shape}")
-    # 压缩过程
-    compressed_k = compressor_k(processed_keys)
-    compressed_v = compressor_v(processed_values)
-    logging.debug(f"压缩后的缓存形状：{compressed_k.shape}")
+    # Check for bfloat16 support on CUDA if that's the target
+    if target_device.type == 'cuda' and target_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        logging.warning("Target dtype is bfloat16, but current CUDA device may not fully support it. "
+                        "Consider PyTorch version or device capabilities. Falling back parameters to float32 for safety, "
+                        "but mixed precision might still use bfloat16 for ops if supported.")
+        # Option 1: Change param dtype and let autocast handle ops if possible
+        # target_dtype_for_params = torch.float32
+        # Option 2: Or, if bfloat16 is essential, this setup might error or perform poorly.
+        # For now, we'll proceed with the configured target_dtype for parameters,
+        # and rely on PyTorch/AMP to handle it. The model.py already has a warning.
+        pass
 
-    # 转换压缩缓存为模型兼容的格式
-    dynamic_cache = processor.compressed_tensor_to_cache(compressed_k, compressed_v)
+
     logging.debug("成功构建 DynamicCache。")
     
     # 使用 DynamicCache 直接进行模型推理
@@ -116,24 +117,12 @@ def main():
     input_ids = inputs.input_ids
     attention_mask = inputs.attention_mask
 
-    print("generate() output:")
-    out = model.generate(
-        **inputs,
-        max_new_tokens=128,
-        do_sample=False,       # 贪婪
-        temperature=1.0,
-        top_p=1.0,
-        num_beams=1
-    )
-    print(tokenizer.decode(out[0], skip_special_tokens=False))
-    print()
-
     ##############################
     # 手动自回归，"严格步进"实现   #
     ##############################
 
     generated_ids = input_ids
-    past_key_values = dynamic_cache
+    past_key_values = CompCache(config=compressor_config)
     cur_input_ids = input_ids
     stopped = False
 
