@@ -1,7 +1,7 @@
 import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
-from modeling_compressor.CCache import CompCache, CacheProcessor
+from kvcompressor.modeling_compressor.CCache_old import CompCache, CacheProcessor
 from modeling_compressor.model import KVCompressor
 from modeling_compressor.untis import CompressorConfig
 import logging
