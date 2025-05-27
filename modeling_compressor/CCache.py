@@ -191,8 +191,15 @@ class CompCache(DynamicCache):
         self._ensure_device_from_input(key_states) 
         batch_size, num_heads, incremental_seq_len, head_dim = key_states.shape
         self._ensure_layer_cache_initialized(layer_idx, batch_size, num_heads, head_dim, key_states.dtype)
-        self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
-        self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+
+        # 当拼接时，确保旧的缓存部分是分离的
+        # key_states 和 value_states (增量) 是新的，带有当前的计算图
+        old_k_cache = self.key_cache[layer_idx].detach().clone() # 分离并复制旧的缓存内容
+        old_v_cache = self.value_cache[layer_idx].detach().clone() # 分离并复制旧的缓存内容
+
+        self.key_cache[layer_idx] = torch.cat([old_k_cache, key_states], dim=-2)
+        self.value_cache[layer_idx] = torch.cat([old_v_cache, value_states], dim=-2)
+
         if layer_idx == 0: self._seen_tokens += incremental_seq_len
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
@@ -325,13 +332,16 @@ class CompCache(DynamicCache):
             current_k_layer = self.key_cache[original_layer_idx] # 这是压缩操作前的状态
             current_v_layer = self.value_cache[original_layer_idx]
             
-            head_k_part = current_k_layer[:, :, :initial_keep_len, :]
-            head_v_part = current_v_layer[:, :, :initial_keep_len, :]
+            # head_part 和 tail_part 是历史KV，它们不应该将梯度带到当前压缩操作中
+            # 也不应该从当前压缩操作接收梯度后影响到之前的计算图（如果它们源自之前的压缩）
+            # 当它们与新的压缩段 new_k_seg_for_layer 拼接时，
+            # 为了避免计算图混淆，对它们进行 detach 是安全的，因为梯度不应流过它们到更早的步骤。
+            head_k_part = current_k_layer[:, :, :initial_keep_len, :].detach().clone() # Detach 历史部分
+            head_v_part = current_v_layer[:, :, :initial_keep_len, :].detach().clone() # Detach 历史部分
             
-            # 原始提取段之后的部分
             segment_end_idx_original = initial_keep_len + segment_len_to_compress
-            tail_k_part = current_k_layer[:, :, segment_end_idx_original:, :]
-            tail_v_part = current_v_layer[:, :, segment_end_idx_original:, :]
+            tail_k_part = current_k_layer[:, :, segment_end_idx_original:, :].detach().clone() # Detach 历史部分
+            tail_v_part = current_v_layer[:, :, segment_end_idx_original:, :].detach().clone() # Detach 历史部分
             
             self.key_cache[original_layer_idx] = torch.cat([head_k_part, new_k_seg_for_layer, tail_k_part], dim=-2)
             self.value_cache[original_layer_idx] = torch.cat([head_v_part, new_v_seg_for_layer, tail_v_part], dim=-2)

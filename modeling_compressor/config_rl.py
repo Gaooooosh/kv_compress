@@ -19,18 +19,32 @@ TRAINING_PARAMS = {
     "KL_TEMPERATURE": 1.0,              # KL散度中softmax的温度参数（如果需要调整）
 
     # 训练过程相关参数
-    "NUM_TRAINING_STEPS": 50000,          # 总训练步数 (替代 NUM_EPISODES)
+    "NUM_TRAINING_STEPS": 2000,          # 总训练步数 (替代 NUM_EPISODES)
     "MAX_TOKENS_PER_EPISODE": 512,       # 每个“回合”或数据段处理的最大token数量 (用于reset环境)
     "COMPRESSOR_MODEL_SAVE_FREQ_STEPS": 1000, # 每多少步保存一次压缩器模型
     "LOG_FREQ_STEPS": 10,                 # 每多少步打印一次日志
     "GRADIENT_CLIP_NORM": 1.0,            # 梯度裁剪的范数 (0表示不裁剪)
 }
 
+DATASET_CONFIG = {
+    "dataset_name": "wikitext",  # Hugging Face datasets 名称, e.g., "wikitext", "c4", "bookcorpus"
+    "dataset_config_name": "wikitext-103-raw-v1", # 数据集子配置, e.g., "wikitext-103-raw-v1", "en" for c4
+    "text_column": "text",              # 数据集中包含文本的列名
+    "split": "train",                   # 使用哪个数据分割, e.g., "train", "validation"
+    "max_samples_to_load": 10000,       # (可选) 加载的最大样本数量，用于快速测试或限制数据集大小
+    "min_text_length_for_sample": 256,  # 采样文本的最小长度 (tokenized)
+    "max_text_length_for_sample": 1024, # 采样文本的最大长度 (tokenized) - 用于分段处理长文本
+                                        # IDEAL_TOTAL_CONTEXT_LENGTH 也可以作为这个的参考
+}
+TRAINING_PARAMS["dataset_args"] = DATASET_CONFIG # 将数据集配置嵌套进去
+
+
 # LLM 相关配置 (保持不变)
 LLM_CONFIG = {
     "model_name_or_path": "/raid_sdh/home/xyg/PRETRAINED_MODEL/TinyLlama-chat",
     "tokenizer_name_or_path": "/raid_sdh/home/xyg/PRETRAINED_MODEL/TinyLlama-chat",
     "device": "cuda" if torch.cuda.is_available() else "cpu",
+    # "device": "cpu",
     "max_new_tokens_per_llm_step": TRAINING_PARAMS["TOKENS_TO_GENERATE_PER_STEP"], # 与上面同步
     "max_context_length_for_llm_input": TRAINING_PARAMS["IDEAL_TOTAL_CONTEXT_LENGTH"],
 }
