@@ -6,24 +6,27 @@ import torch
 # 主要用于环境、LLM 和 KVCompressor 训练的参数
 TRAINING_PARAMS = {
     # 环境及LLM相关
-    "IDEAL_TOTAL_CONTEXT_LENGTH": 1024,  # LLM处理的最大上下文长度参考值
-    "MIN_UNCOMPRESSED_CONTEXT_LENGTH": 256, # 奖励函数中可能用到的参考值（当前极简版奖励简单）
+    "IDEAL_TOTAL_CONTEXT_LENGTH": 2048,  # LLM处理的最大上下文长度参考值
+    "MIN_UNCOMPRESSED_CONTEXT_LENGTH": 1980, # 奖励函数中可能用到的参考值（当前极简版奖励简单）
     
     # 模拟LLM新token流入的参数 (在Environment中使用)
     "TOKENS_TO_GENERATE_PER_STEP": 1, # 环境每一步让LLM生成多少个新token
                                          # 为了精确对比logits，通常设为1
-
+    "USE_LR_SCHEDULER":True,
+    "LR_SCHEDULER_STEP_SIZE":5000.,
+    "LR_SCHEDULER_GAMMA":0.5,
     # KVCompressor 训练相关参数
-    "COMPRESSOR_LEARNING_RATE": 0.0001,   # KVCompressor的学习率
+    "COMPRESSOR_LEARNING_RATE": 0.0002,   # KVCompressor的学习率
     "LOSS_FUNCTION": "KL",              # "KL" for KL Divergence, "MSE" for Mean Squared Error for logits comparison
     "KL_TEMPERATURE": 1.0,              # KL散度中softmax的温度参数（如果需要调整）
-
+    
     # 训练过程相关参数
-    "NUM_TRAINING_STEPS": 2000,          # 总训练步数 (替代 NUM_EPISODES)
+    "NUM_TRAINING_STEPS": 50000,          # 总训练步数 (替代 NUM_EPISODES)
     "MAX_TOKENS_PER_EPISODE": 512,       # 每个“回合”或数据段处理的最大token数量 (用于reset环境)
-    "COMPRESSOR_MODEL_SAVE_FREQ_STEPS": 1000, # 每多少步保存一次压缩器模型
+    "COMPRESSOR_MODEL_SAVE_FREQ_STEPS": 5000, # 每多少步保存一次压缩器模型
     "LOG_FREQ_STEPS": 10,                 # 每多少步打印一次日志
     "GRADIENT_CLIP_NORM": 1.0,            # 梯度裁剪的范数 (0表示不裁剪)
+    "LOAD_PRETRAINED_COMPRESSOR_PATH":"/raid_sdh/home/xyg/compressor_training_output_dataset/saved_compressor_models/kv_compressor_step_15000.pth"
 }
 
 DATASET_CONFIG = {
@@ -43,7 +46,7 @@ TRAINING_PARAMS["dataset_args"] = DATASET_CONFIG # 将数据集配置嵌套进�
 LLM_CONFIG = {
     "model_name_or_path": "/raid_sdh/home/xyg/PRETRAINED_MODEL/TinyLlama-chat",
     "tokenizer_name_or_path": "/raid_sdh/home/xyg/PRETRAINED_MODEL/TinyLlama-chat",
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "device": "cuda:4" if torch.cuda.is_available() else "cpu",
     # "device": "cpu",
     "max_new_tokens_per_llm_step": TRAINING_PARAMS["TOKENS_TO_GENERATE_PER_STEP"], # 与上面同步
     "max_context_length_for_llm_input": TRAINING_PARAMS["IDEAL_TOTAL_CONTEXT_LENGTH"],
@@ -53,14 +56,14 @@ LLM_CONFIG = {
 # 在创建CompressorConfig实例时，会从untis.py获取，RLEnvironment会尝试根据LLM覆盖部分
 DEFAULT_COMPRESSOR_CONFIG_PARAMS = {
     "reduction_factor": 4,
-    "output_seq_len": 2,
+    "output_seq_len": 4,
     "num_attention_heads": 8,
     "use_mixed_precision": False,
     "torch_dtype": "torch.float32", # 将在untis.py中转换为torch.dtype对象
     "kernel_size": 3,
     "padding": 1,
-    "compression_threshold": 10, # CompCache中判断是否压缩的阈值 (固定规则)
-    "initial_uncompressed_keep_length": 4
+    "compression_threshold": 128, # CompCache中判断是否压缩的阈值 (固定规则)
+    "initial_uncompressed_keep_length": 8
 }
 
 

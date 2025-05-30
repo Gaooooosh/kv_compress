@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 # Assuming CompressorConfig is in .untis, if not, adjust import
 # from .untis import CompressorConfig 
 
@@ -54,164 +55,75 @@ class LearnedPoolingLayer(nn.Module):
 
 class KVCompressor(nn.Module):
     def __init__(self, config: CompressorConfig):
-        super(KVCompressor, self).__init__()
+        super().__init__()
         self.config = config
-        self.param_dtype = config.torch_dtype # Intended dtype for all layer parameters
+        D_feat = config.input_dim
+        D_feat_intermediate_conv = D_feat * 2 
+        reduction_factor_conv_stride = config.reduction_factor # 假设主要长度缩减在conv2
+        self.output_seq_len_pool = config.output_seq_len
+        
+        # --- 卷积层 ---
+        self.conv1 = nn.Conv1d(D_feat, D_feat_intermediate_conv, kernel_size=3, stride=1, padding=1)
+        self.norm_conv1 = nn.LayerNorm(D_feat_intermediate_conv) # 作用于特征维
+        
+        # Conv2 - stride会缩短序列长度
+        # 计算conv2的padding以尽量维持长度，或者让AdaptiveAvgPool1d处理
+        # 如果stride=2, kernel=3, padding=1, L_out = floor((L_in + 2*1 - 1*(3-1) -1)/2 + 1) = floor(L_in/2)
+        self.conv2 = nn.Conv1d(D_feat_intermediate_conv, D_feat, kernel_size=3, 
+                               stride=reduction_factor_conv_stride, 
+                               padding=1) 
+        self.norm_conv2 = nn.LayerNorm(D_feat)
 
-        self.conv1d = nn.Conv1d(
-            in_channels=config.input_dim,
-            out_channels=config.input_dim,
-            kernel_size=getattr(config, 'kernel_size', 3), # Use getattr for potential missing attrs
-            stride=config.reduction_factor,
-            padding=getattr(config, 'padding', 1),
-            dtype=self.param_dtype # Crucial: Initialize layer with target dtype
-        )
-        
-        # Assuming input_dim for LearnedPoolingLayer refers to the feature dimension
-        # as per the original einsum.
-        self.pool = LearnedPoolingLayer(
-            input_dim=config.input_dim,
-            layer_dtype=self.param_dtype # Pass dtype here
-        )
-        
-        self.attention = nn.MultiheadAttention(
-            embed_dim=config.input_dim, # Assuming pooling output still has config.input_dim features
-                                        # or that the pooling layer's output dim matches this.
-                                        # If LearnedPoolingLayer's output is (Batch, SeqLen), this will be a mismatch.
-                                        # The comment "x = self.pool(x) # 32 4096" suggests output is (Batch, Features)
-                                        # This means LearnedPoolingLayer should be pooling the sequence dimension.
-            num_heads=config.num_attention_heads,
-            batch_first=True,
-            dtype=self.param_dtype # Crucial
-        )
-        
-        self.fc = nn.Linear(
-            config.input_dim, # Input features to FC
-            config.input_dim * config.output_seq_len,
-            dtype=self.param_dtype # Crucial
-        )
-        self.output_seq_len = config.output_seq_len
-        self.use_mixed_precision = config.use_mixed_precision
+        # --- 池化层 ---
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(self.output_seq_len_pool)
+
+        # --- MLP层 ---
+        D_mlp_hidden = D_feat * 2
+        self.fc1 = nn.Linear(D_feat, D_mlp_hidden)
+        self.mlp_activation = nn.GELU()
+        self.fc2 = nn.Linear(D_mlp_hidden, D_feat)
+        self.norm_mlp_out = nn.LayerNorm(D_feat) # 对MLP的输出进行归一化
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not isinstance(x, torch.Tensor):
-            raise ValueError("Input must be a torch.Tensor")
+        # x shape: (B, Num_P_Layers, S_orig, D_feat)
+        B, Num_P_Layers, S_orig, D_feat_in = x.shape
         
-        batch_size, l_layers, seq_len_orig, dim_features = x.size()
-        original_input_dtype = x.dtype # Store original dtype for final cast if needed
-        device = x.device
+        # Reshape for Conv1d: (N, D_feat_in, S_orig) where N = B*Num_P_Layers
+        x_for_conv = x.view(-1, S_orig, D_feat_in).permute(0, 2, 1) 
+        N = x_for_conv.shape[0]
+
+        # --- 卷积模块 ---
+        # Layer 1
+        c1_out = self.conv1(x_for_conv) # (N, D_feat_intermediate, S_orig)
+        c1_norm = self.norm_conv1(c1_out.permute(0, 2, 1)).permute(0, 2, 1) # Norm on features
+        c1_act = F.gelu(c1_norm)
+        # 可以加入残差: c1_act = c1_act + self.conv1_shortcut(x_for_conv) 
+
+        # Layer 2
+        c2_out = self.conv2(c1_act) # (N, D_feat, S_reduced_by_conv)
+        c2_norm = self.norm_conv2(c2_out.permute(0, 2, 1)).permute(0, 2, 1) # Norm on features
+        conv_final_out = F.gelu(c2_norm)
+        # 可以加入残差: conv_final_out = conv_final_out + self.conv2_shortcut(c1_act_ appropriately_sized)
         
-        # Determine device type for autocast, handling 'mps' if necessary
-        current_device_type = device.type
-        if current_device_type == 'mps': # MPS has specific autocast behavior
-            # For MPS, dtype in autocast is usually not specified or set to None.
-            # It might also depend on PyTorch version.
-            # If issues persist on MPS, specific handling might be needed.
-            # For now, let's assume 'cpu' behavior for autocast if MPS to avoid errors,
-            # or let it handle itself if `self.use_mixed_precision` is False.
-            autocast_device_type_for_amp = 'cpu' if self.use_mixed_precision else 'cpu' # Or handle MPS more directly
-        else:
-            autocast_device_type_for_amp = current_device_type if self.use_mixed_precision else 'cpu'
+        # --- 池化模块 ---
+        # adaptive_pool expects (N, C, L_in) -> (N, C, L_out)
+        pooled_features = self.adaptive_pool(conv_final_out) # (N, D_feat, output_seq_len)
+        
+        # Transpose for MLP: (N, output_seq_len, D_feat)
+        sequence_for_mlp = pooled_features.permute(0, 2, 1) 
 
-        # Determine target dtype for autocast operations
-        autocast_target_dtype = None
-        if self.use_mixed_precision:
-            if self.param_dtype == torch.bfloat16:
-                autocast_target_dtype = torch.bfloat16
-            elif self.param_dtype == torch.float16:
-                autocast_target_dtype = torch.float16
-            # If self.param_dtype is float32, autocast_target_dtype remains None,
-            # and AMP will use its default (e.g., float16 for CUDA).
-
-        with torch.amp.autocast(
-            device_type=autocast_device_type_for_amp, # Use determined device type
-            enabled=self.use_mixed_precision,
-            dtype=autocast_target_dtype # Explicitly set autocast operation dtype
-        ):
-            # Reshape for Conv1D: (batch_size * l_layers, dim_features, seq_len_orig)
-            x_reshaped = x.view(batch_size * l_layers, seq_len_orig, dim_features)
-            # Input to conv1d should be (N, C_in, L_in)
-            # N = batch_size * l_layers
-            # C_in = dim_features (config.input_dim)
-            # L_in = seq_len_orig
-            x_for_conv = x_reshaped.permute(0, 2, 1) # Shape: (B*L, D, S_orig)
-            
-            # If not using mixed precision, but parameters are not float32,
-            # ensure input matches parameter dtype.
-            # However, if parameters are already self.param_dtype, and autocast is disabled,
-            # input should match self.param_dtype.
-            if not self.use_mixed_precision and x_for_conv.dtype != self.param_dtype:
-                 x_for_conv = x_for_conv.to(self.param_dtype)
-
-            # Inside autocast, operations will use autocast_target_dtype or self.param_dtype
-            # x_for_conv will be cast by autocast if enabled and dtypes differ.
-            
-            # Conv1D
-            # Input: (B*L, D, S_orig), e.g., (32, 4096, 128)
-            # Output: (B*L, D, S_reduced), e.g., (32, 4096, 8)
-            conv_out = self.conv1d(x_for_conv)
-            
-            # Permute for Pooling/Attention: (B*L, S_reduced, D)
-            # e.g., (32, 8, 4096)
-            permuted_conv_out = conv_out.permute(0, 2, 1)
-
-            # Pooling
-            # Input to pool: (32, 8, 4096)
-            # If LearnedPoolingLayer uses original 'bid,d->bd' with weights (4096):
-            #   pooled_out will be (32, 8). This is (Batch, SeqReduced).
-            # The comment "# x = self.pool(x) # 32 4096" implies pooled_out should be (32, 4096) (Batch, Features).
-            # This requires LearnedPoolingLayer to pool the sequence dimension (size 8).
-            # For now, using the existing LearnedPoolingLayer structure.
-            # If pooled_out is (32,8), attention will fail if embed_dim is 4096.
-            # Let's assume the comment "# 32 4096" is the target shape for x after pooling.
-            # This means the pooling operation results in (batch_size*l, feature_dim).
-            # For this to happen with the current LearnedPoolingLayer, its internal logic would need to change.
-            # For the sake of this fix, we assume that `pooled_out` will have `dim_features`.
-            pooled_out = self.pool(permuted_conv_out)
-
-            # Critical check for pooling output dimension:
-            # If pooled_out.shape is (B*L, S_reduced) due to 'bid,d->bd' and input_dim=D:
-            # And self.attention expects embed_dim=D, then unsqueeze(1) won't work.
-            # The comment "x = x.unsqueeze(1) # 32 1 4096" implies pooled_out is (32, 4096).
-            # This means the pooling correctly yields (Batch, Features).
-            # If your LearnedPoolingLayer's `input_dim` is `config.input_dim` (features),
-            # and einsum is `bid,d->bd`, output is `(B*L, S_reduced)`.
-            # For the code to proceed as commented, `pooled_out` must be `(B*L, dim_features)`.
-            # This would happen if `LearnedPoolingLayer` was, e.g., a global average pool over S_reduced,
-            # or a learned pool over S_reduced.
-
-            # Assuming pooled_out is (B*L, dim_features) as per comment # 32 4096
-            # If not, the following unsqueeze and attention will have dimension mismatch.
-            # Corrected path would involve fixing LearnedPoolingLayer or using a different pool.
-            
-            att_input = pooled_out.unsqueeze(1) # Shape: (B*L, 1, D_feat), e.g. (32, 1, 4096)
-            
-            attn_output, _ = self.attention(query=att_input, key=att_input, value=att_input)
-            # Output of attention: (B*L, 1, D_feat), e.g. (32, 1, 4096)
-
-            # Fully Connected Layer
-            fc_input = attn_output.squeeze(1) # Shape: (B*L, D_feat), e.g. (32, 4096)
-            fc_out = self.fc(fc_input)
-            # Output of FC: (B*L, D_feat * output_seq_len)
-
-            # Reshape final output
-            # Target shape: (batch_size, l_layers, self.output_seq_len, dim_features)
-            final_output_mixed_precision = fc_out.view(
-                batch_size, l_layers, self.output_seq_len, dim_features
-            )
-            
-            # The .to(original_input_dtype) is done outside autocast if needed
-            # If it's inside, it might cast prematurely.
-            # If the rest of the model expects original_input_dtype, this cast is fine.
-
-        # Cast to original input dtype if it was different from the processing dtype.
-        # This is what the user had, so preserving it.
-        # If self.param_dtype is the desired output, use that.
-        if final_output_mixed_precision.dtype != original_input_dtype:
-             final_output = final_output_mixed_precision.to(original_input_dtype)
-        else:
-             final_output = final_output_mixed_precision
-             
+        # --- MLP模块 ---
+        identity_mlp = sequence_for_mlp
+        mlp_out1 = self.fc1(sequence_for_mlp)
+        mlp_out1_act = self.mlp_activation(mlp_out1)
+        
+        mlp_final_features = self.fc2(mlp_out1_act) # (N, output_seq_len, D_feat)
+        mlp_final_res = mlp_final_features + identity_mlp # 残差连接
+        mlp_output_norm = self.norm_mlp_out(mlp_final_res) # 输出归一化
+        
+        # Reshape back to (B, Num_P_Layers, output_seq_len, D_feat)
+        final_output = mlp_output_norm.view(B, Num_P_Layers, self.output_seq_len_pool, D_feat_in)
+        
         return final_output
 
 if __name__ == '__main__':
