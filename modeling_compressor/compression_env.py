@@ -17,12 +17,14 @@ class CompressionEnv:
                  llm_model_name_or_path: str,
                  tokenizer_name_or_path: str,
                  llm_device: str,
-                 training_params: Dict[str, Any] = TRAINING_PARAMS,
-                 llm_config_params: Dict[str, Any] = LLM_CONFIG):
+                 training_params: Dict[str, Any] = TRAINING_PARAMS, # training_params 现在包含 curriculum_config 和 dataset_args
+                 llm_config_params: Dict[str, Any] = LLM_CONFIG,
+                 current_stage_dataset_args: Optional[Dict[str, Any]] = None): 
         print("Initializing Compression Environment with Dataset Support...")
         self.training_params = training_params
         self.llm_config_params = llm_config_params
-        self.dataset_args = training_params.get("dataset_args", {}) # 获取数据集配置
+        self.dataset_args = current_stage_dataset_args if current_stage_dataset_args is not None \
+                            else training_params.get("dataset_args", {})
         self.device = torch.device(llm_device)
 
         print(f"Loading Tokenizer: {tokenizer_name_or_path}")
@@ -36,8 +38,7 @@ class CompressionEnv:
         self.llm_model.eval()
         print("Main LLM Model loaded.")
 
-        # 动态调整CompressorConfig (与之前版本类似)
-        # ... (这部分基本不变，确保从llm_model.config获取正确的维度信息) ...
+        # 动态调整CompressorConfig
         llm_num_layers = self.llm_model.config.num_hidden_layers
         llm_num_heads = self.llm_model.config.num_attention_heads
         llm_num_kv_heads = getattr(self.llm_model.config, 'num_key_value_heads', llm_num_heads)
@@ -63,83 +64,138 @@ class CompressionEnv:
 
         # 加载和预处理数据集
         self.dataset: Optional[Dataset] = None
-        self._load_and_prepare_dataset()
+        self.all_tokenized_chunks: List[List[int]] = [] # 存储所有预处理好的token块
+        self.dataset_chunk_iterator: Optional[iter] = None
+        self._load_and_prepare_dataset() # 加载并处理数据集
 
-        self._current_text_segment_token_ids: List[int] = [] # 当前正在处理的文本段的token ids
-        self._current_segment_processed_tokens = 0 # 在当前文本段中已处理（作为LLM输入）的token数
-        self._past_key_values_ref: Optional[Tuple[Tuple[torch.Tensor, ...], ...]] = None
-        self._current_episode_total_tokens_generated = 0 # 当前“回合”LLM新生成的token数 (用于done判断)
+        self._current_text_segment_token_ids: List[int] = []
+        self._current_segment_processed_tokens = 0
+        self._past_key_values_ref = None
+        self._current_episode_total_tokens_generated = 0
+        self.compression_trigger_threshold = compressor_config.compression_threshold
+        self.initial_keep_len = compressor_config.initial_uncompressed_keep_length
+        print(f"Compression Environment initialized for dataset args: {self.dataset_args.get('hf_dataset_name', 'default prompt')}")
 
         self.compression_trigger_threshold = compressor_config.compression_threshold
         self.initial_keep_len = compressor_config.initial_uncompressed_keep_length
         print("Compression Environment initialized successfully with dataset.")
-
+        self.ema_alpha = self.training_params.get("EMA_ALPHA_LOGITS_REF", 0.1) # 从配置获取alpha
+        self.ema_logits_ref: Optional[torch.Tensor] = None # 初始化EMA平滑参考Logits
+        print(f"Using EMA for reference logits with alpha: {self.ema_alpha}")
 
     def _load_and_prepare_dataset(self):
-        """加载并准备数据集"""
-        dataset_name = self.dataset_args.get("dataset_name")
-        if not dataset_name:
-            print("No dataset_name provided in config. Environment will use a default short prompt for reset.")
-            self.dataset = None
-            return
+        """根据 self.dataset_args 加载并准备数据集，将其切分为token块。"""
+        source_type = self.dataset_args.get("source_type", "huggingface_dataset")
+        self.all_tokenized_chunks = [] # 清空
 
-        print(f"Loading dataset: {dataset_name}...")
-        try:
-            # 加载数据集，可以取一部分样本用于快速迭代
-            num_samples = self.dataset_args.get("max_samples_to_load", None)
-            split_arg = self.dataset_args.get("split", "train")
-            if num_samples:
-                split_arg = f"{split_arg}[:{num_samples}]" # e.g., "train[:1000]"
+        if source_type == "huggingface_dataset":
+            dataset_name = self.dataset_args.get("hf_dataset_name")
+            if not dataset_name:
+                print("No hf_dataset_name provided. Using default prompt for data generation.")
+                return # 将依赖 _get_next_text_segment_from_dataset 中的回退逻辑
 
-            self.dataset = load_dataset(
-                dataset_name,
-                self.dataset_args.get("dataset_config_name"),
-                split=split_arg,
-                # streaming=True, # 可以考虑流式加载大型数据集
-            )
-            self.dataset = self.dataset.filter(lambda example: len(example[self.dataset_args["text_column"]]) > self.dataset_args.get("min_text_length_for_sample", 50)) # 过滤掉太短的文本
-            self.dataset = self.dataset.shuffle(seed=TRAINING_PARAMS.get("RANDOM_SEED", 42)) # 打乱数据集
-            self.dataset_iterator = iter(self.dataset) # 创建迭代器
-            print(f"Dataset '{dataset_name}' loaded. Number of samples (approx): {len(self.dataset) if hasattr(self.dataset, '__len__') else 'Streaming'}")
-        except Exception as e:
-            print(f"Error loading dataset '{dataset_name}': {e}. Will use default prompt.")
-            self.dataset = None
+            print(f"Loading HF dataset: {dataset_name} with config: {self.dataset_args.get('hf_dataset_config_name')}")
+            try:
+                num_samples_str = str(self.dataset_args.get("max_samples_to_load", ""))
+                split_arg = self.dataset_args.get("hf_split", "train")
+                if num_samples_str: # e.g., "train[:1000]" or "train[:10%]"
+                     if "%" in num_samples_str or ":" in split_arg : # 如果split_arg本身已经是切片形式
+                         pass # datasets库能处理 train[:1000][:10%] 这样的情况，但最好避免
+                     else: # 简单拼接
+                         split_arg = f"{split_arg}[{num_samples_str}]" if ":" not in num_samples_str else f"{split_arg}{num_samples_str}"
+
+
+                raw_dataset = load_dataset(
+                    dataset_name,
+                    self.dataset_args.get("hf_dataset_config_name"),
+                    split=split_arg,
+                    # streaming=True, # 流式加载对分块和打乱更复杂
+                )
+                
+                # 过滤原始文本长度 (可选，但有助于获取同质化数据)
+                min_raw_len = self.dataset_args.get("min_raw_text_length", 0)
+                max_raw_len = self.dataset_args.get("max_raw_text_length", float('inf'))
+                text_col = self.dataset_args["hf_text_column"]
+                
+                if min_raw_len > 0 or max_raw_len != float('inf'):
+                    raw_dataset = raw_dataset.filter(
+                        lambda ex: min_raw_len <= len(ex[text_col]) <= max_raw_len
+                    )
+
+                # 分块和Tokenize
+                chunk_size = self.dataset_args.get("max_tokenized_length", 512)
+                stride = self.dataset_args.get("stride_for_chunking", chunk_size // 2)
+                min_chunk_len = self.dataset_args.get("min_tokenized_length", 64)
+
+                for example in raw_dataset:
+                    text = example[text_col]
+                    if not text or not isinstance(text, str): continue
+                    text = " ".join(text.split()) # 清理空格
+                    
+                    # 先对整个文档tokenize，避免在循环中重复tokenize相同前缀
+                    # add_special_tokens=False 是为了避免在文档中间加入bos/eos，除非LLM期望这样
+                    tokenized_document = self.tokenizer(text, add_special_tokens=False).input_ids
+                    
+                    if not tokenized_document: continue
+
+                    for i in range(0, len(tokenized_document) - min_chunk_len + 1, stride):
+                        chunk = tokenized_document[i : i + chunk_size]
+                        if len(chunk) >= min_chunk_len: # 确保块至少有最小长度
+                           self.all_tokenized_chunks.append(chunk)
+                
+                if not self.all_tokenized_chunks:
+                    print(f"Warning: No valid chunks generated from dataset {dataset_name}. Check filters and chunking params.")
+                else:
+                    random.shuffle(self.all_tokenized_chunks) # 打乱所有块
+                    print(f"Dataset processed into {len(self.all_tokenized_chunks)} tokenized chunks.")
+
+            except Exception as e:
+                print(f"Error loading or processing HF dataset '{dataset_name}': {e}. Will use default prompt.")
+        
+        elif source_type == "fixed_list": # 用于第一阶段的固定文本
+            fixed_texts = self.dataset_args.get("fixed_texts", [])
+            if not fixed_texts:
+                print("Warning: source_type is 'fixed_list' but no 'fixed_texts' provided. Using default prompt.")
+            for text in fixed_texts:
+                token_ids = self.tokenizer(text, truncation=True, 
+                                           max_length=self.dataset_args.get("max_tokenized_length", 512)).input_ids
+                if len(token_ids) >= self.dataset_args.get("min_tokenized_length", 10):
+                    self.all_tokenized_chunks.append(token_ids)
+            if self.all_tokenized_chunks:
+                # 对于固定列表，可以重复使用以增加稳定性
+                self.all_tokenized_chunks = self.all_tokenized_chunks * self.dataset_args.get("fixed_list_repeat", 50)
+                random.shuffle(self.all_tokenized_chunks)
+                print(f"Using fixed list of {len(fixed_texts)} texts, repeated to {len(self.all_tokenized_chunks)} chunks.")
+        else:
+            print(f"Unsupported dataset_source_type: {source_type}. Using default prompt.")
+
+        if not self.all_tokenized_chunks: # 如果没有任何数据块
+             self.all_tokenized_chunks.append(
+                 self.tokenizer("This is a default fallback segment.", return_tensors="pt").input_ids[0].tolist()
+             )
+             print("Initialized with a single default fallback segment.")
+        
+        self.dataset_chunk_iterator = iter(self.all_tokenized_chunks)
 
 
     def _get_next_text_segment_from_dataset(self) -> List[int]:
-        """从数据集中获取下一个文本段并tokenize"""
-        if not self.dataset or not self.dataset_iterator:
-            # print("Dataset not available or exhausted, using default prompt.")
-            # Fallback to a very short, fixed prompt if dataset fails or ends
-            default_prompt = "This is a default sentence for the language model."
-            return self.tokenizer(default_prompt, return_tensors="pt").input_ids[0].tolist()
-
-        text_col = self.dataset_args["text_column"]
-        max_len = self.dataset_args.get("max_text_length_for_sample", 
-                                        self.training_params.get("IDEAL_TOTAL_CONTEXT_LENGTH", 512))
-        
+        """从预处理好的 all_tokenized_chunks 中获取下一个块。"""
         try:
-            example = next(self.dataset_iterator)
-            text = example[text_col]
-            # 清理文本，移除过多换行等 (可选)
-            text = " ".join(text.split()) 
-            token_ids = self.tokenizer(text, truncation=True, max_length=max_len).input_ids
-            # print(f"  Loaded segment from dataset, length: {len(token_ids)}")
-            return token_ids
+            return next(self.dataset_chunk_iterator)
         except StopIteration:
-            print("Dataset iterator exhausted. Re-shuffling and creating new iterator.")
-            self.dataset = self.dataset.shuffle(seed=TRAINING_PARAMS.get("RANDOM_SEED", 42) + 1) # 用不同的种子再次打乱
-            self.dataset_iterator = iter(self.dataset)
+            if not self.all_tokenized_chunks: # 如果列表本身是空的（不应发生，因为有fallback）
+                return self.tokenizer("Fallback segment, list was empty.", return_tensors="pt").input_ids[0].tolist()
+            
+            # print("Chunk iterator exhausted. Re-shuffling all_tokenized_chunks.")
+            random.shuffle(self.all_tokenized_chunks) # 重新打乱所有块
+            self.dataset_chunk_iterator = iter(self.all_tokenized_chunks)
             try:
-                example = next(self.dataset_iterator)
-                text = example[text_col]
-                text = " ".join(text.split())
-                token_ids = self.tokenizer(text, truncation=True, max_length=max_len).input_ids
-                return token_ids
-            except StopIteration: # 如果数据集实在太小
-                print("Error: Dataset exhausted even after reshuffle. Using default prompt.")
-                default_prompt = "This is a default sentence after dataset exhaustion."
-                return self.tokenizer(default_prompt, return_tensors="pt").input_ids[0].tolist()
+                return next(self.dataset_chunk_iterator)
+            except StopIteration: # 如果 all_tokenized_chunks 仍然是空的（例如只有一个元素且已用完）
+                 return self.all_tokenized_chunks[0] # 返回第一个（也是唯一一个）
+        except Exception as e:
+            print(f"Error getting next text segment: {e}. Returning default.")
+            return self.tokenizer("Error fallback segment.", return_tensors="pt").input_ids[0].tolist()
 
 
 
@@ -153,7 +209,7 @@ class CompressionEnv:
         """重置环境，加载新的文本段作为上下文"""
         self.comp_cache._initialize_cache_lists() # 清空并重置 CompCache
         self._past_key_values_ref = None # 重置参考路径的KV缓存
-
+        self.ema_logits_ref = None # 重置EMA平滑参考Logits
         self._current_text_segment_token_ids = self._get_next_text_segment_from_dataset()
         self._current_segment_processed_tokens = 0 # 在当前段中已作为LLM输入的token数
         self._current_episode_total_tokens_generated = 0 # 新生成的token计数器重置
@@ -192,6 +248,12 @@ class CompressionEnv:
                 past_key_values=None, use_cache=True, return_dict=True
             )
             self._past_key_values_ref = outputs_ref.past_key_values
+            # 用预填充后的第一个有效 logits_ref 初始化 ema_logits_ref
+            if outputs_ref.logits is not None and outputs_ref.logits.numel() > 0:
+                initial_logits_for_ema = outputs_ref.logits[:, -1, :].detach().clone() # 取最后一个token的logits
+                self.ema_logits_ref = initial_logits_for_ema
+            else:
+                self.ema_logits_ref = None # 如果预填充没有产生有效logits
         
     def _calculate_loss(self, logits_compressed: torch.Tensor, logits_ref: torch.Tensor) -> torch.Tensor: # (保持不变)
         loss_type = self.training_params.get("LOSS_FUNCTION", "KL").upper()
@@ -264,6 +326,15 @@ class CompressionEnv:
                 )
                 logits_ref = outputs_ref.logits[:, -1, :]
                 self._past_key_values_ref = outputs_ref.past_key_values
+
+                # --- 更新EMA平滑参考Logits ---
+                if logits_ref is not None and logits_ref.numel() > 0:
+                    current_logits_ref_detached = logits_ref.detach().clone()
+                    if self.ema_logits_ref is None: # 如果是reset后的第一步（或预填充未初始化）
+                        self.ema_logits_ref = current_logits_ref_detached
+                    else:
+                        self.ema_logits_ref = self.ema_alpha * current_logits_ref_detached + \
+                                             (1.0 - self.ema_alpha) * self.ema_logits_ref
         except Exception as e:
             print(f"Error during Reference LLM forward: {e}")
             return None, True, {"error_ref": str(e)}
@@ -288,10 +359,15 @@ class CompressionEnv:
 
         # --- 计算损失 ---
         loss = torch.tensor(0.0, device=self.device) 
-        if logits_compressed is not None and logits_ref is not None:
+        # 使用平滑后的 ema_logits_ref 进行损失计算
+        if logits_compressed is not None and self.ema_logits_ref is not None: # <--- 使用 self.ema_logits_ref
+            loss = self._calculate_loss(logits_compressed, self.ema_logits_ref) # <--- 传递 self.ema_logits_ref
+        elif logits_compressed is not None and logits_ref is not None and self.ema_logits_ref is None:
+            # Fallback to instantaneous logits_ref if ema is somehow still None (should not happen after reset)
+            print("Warning: ema_logits_ref is None, falling back to instantaneous logits_ref for loss calculation.")
             loss = self._calculate_loss(logits_compressed, logits_ref)
-        else: # Logits 获取失败
-             return torch.tensor(10.0, device=self.device, requires_grad=True), True, {"error": "Logits missing"} # 返回一个大损失并结束
+        else:
+            print("Warning: Logits missing (compressed or reference), loss set to 0 for this step.")
 
 
         done = self._current_episode_total_tokens_generated >= self.training_params["MAX_TOKENS_PER_EPISODE"]
