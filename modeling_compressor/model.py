@@ -141,23 +141,6 @@ if __name__ == '__main__':
         kernel_size=3,
         padding=1
     )
-    # Adjust input_dim and num_attention_heads based on typical Llama setup
-    # For Llama-3-8B, n_heads = 32, n_kv_heads = 8, head_dim = 128
-    # So, if input_dim is for one head's features before combining, it's head_dim.
-    # If it's after combining KV heads for compression, it's n_kv_heads * head_dim.
-    # Your infra.py uses: input_dim=head_dim*kv_head_num
-    # num_attention_heads=kv_head_num (for the KVCompressor's internal attention)
-
-    # Let's use values that might align with Llama-3-8B structure for KV cache processing
-    # Say, we are processing KV cache where each of the 8 KV heads has dim 128.
-    # config.input_dim = 8 * 128 = 1024 if processing combined KV heads for a layer.
-    # Or if config.input_dim is the main model's hidden_dim (4096 for Llama-3-8B)
-    # and the KVCompressor operates on this full dimension (unlikely for per-head KV cache).
-    # Your infra.py:
-    # _, kv_head_num, seq_len, head_dim = cache[0][0].size() # (batch, num_kv_heads, seq, head_dim)
-    # compressor_config.input_dim = head_dim * kv_head_num
-    # compressor_config.num_attention_heads = kv_head_num (for KVCompressor's own attention)
-
     # Let's simulate this:
     actual_head_dim = 128
     actual_kv_head_num = 8

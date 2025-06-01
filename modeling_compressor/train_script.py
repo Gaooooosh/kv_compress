@@ -47,9 +47,10 @@ def main_compressor_training_loop():
 
     # --- 1. 初始化 TensorBoard Writer ---
     log_dir_base = TRAINING_PARAMS.get("TENSORBOARD_LOG_DIR", "runs/compressor_curriculum") #
-    current_time_str = datetime.now().strftime('%Y%m%d-%H%M%S') #
-    log_dir = os.path.join(log_dir_base, current_time_str) #
+    log_dir = os.path.join(log_dir_base, 'test') #
     writer = SummaryWriter(log_dir=log_dir) #
+    model_save_dir = TRAINING_PARAMS.get("MODEL_SAVE_DIR","./ckp")
+    output_dir = model_save_dir
     print(f"TensorBoard logs will be saved to: {log_dir}")
 
     # --- 2. 课程学习阶段管理 ---

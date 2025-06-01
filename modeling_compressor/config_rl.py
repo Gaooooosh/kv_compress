@@ -13,12 +13,14 @@ TRAINING_PARAMS = {
     "TOKENS_TO_GENERATE_PER_STEP": 1, # 环境每一步让LLM生成多少个新token
                                          # 为了精确对比logits，通常设为1
     "USE_LR_SCHEDULER":True,
-    "LR_SCHEDULER_STEP_SIZE":5000.,
+    "LR_SCHEDULER_STEP_SIZE":5000,
     "LR_SCHEDULER_GAMMA":0.5,
     # KVCompressor 训练相关参数
     "COMPRESSOR_LEARNING_RATE": 0.0002,   # KVCompressor的学习率
-    "LOSS_FUNCTION": "KL",              # "KL" for KL Divergence, "MSE" for Mean Squared Error for logits comparison
+    "LOSS_FUNCTION": "TOP_K_KL",  # "TOP_K_KL"、"TOP_K_MSE"
     "KL_TEMPERATURE": 1.0,              # KL散度中softmax的温度参数（如果需要调整）
+    "TOP_K_LOGITS": 10,           # only for TOP_K_KL 选择 Top-K 个 logits 进行比较，例如 K=10
+    "KL_TEMPERATURE": 1.0,        # 保持，因为Top-K KL仍然可以用到
     "ACCUMULATION_STEPS" : 10,
     "EMA_ALPHA_LOGITS_REF": 0.1,
     # 训练过程相关参数
@@ -27,7 +29,10 @@ TRAINING_PARAMS = {
     "COMPRESSOR_MODEL_SAVE_FREQ_STEPS": 10000, # 每多少步保存一次压缩器模型
     "LOG_FREQ_STEPS": 100,                 # 每多少步打印一次日志
     "GRADIENT_CLIP_NORM": 0.0,            # 梯度裁剪的范数 (0表示不裁剪)
-    # "LOAD_PRETRAINED_COMPRESSOR_PATH":"/root/autodl-tmp/compressor_training_output_dataset/saved_compressor_models/kv_compressor_step_40000.pth"
+    "ALTERNATING_TRAINING_MODE": "block", # "block" (每N步切换) 或 "step" (每步轮流)
+    "ALTERNATING_BLOCK_SIZE": 5000,        # 如果 mode="block", 每多少步切换一次训练K还是V
+    "MODEL_SAVE_DIR":"/raid_sdh/home/xyg/compressor_training_output_dataset"
+    # "LOAD_PRETRAINED_COMPRESSOR_PATH":""
 }
 
 DATASET_CONFIG = {
@@ -53,26 +58,26 @@ CURRICULUM_LEARNING_CONFIG = {
 
     "stage_1": {
         "enabled": True, # 是否启用第一阶段
-        "duration_steps": 10000,  # 第一阶段持续的训练步数
+        "duration_steps": 20000,  # 第一阶段持续的训练步数
         "dataset_args_override": { # 覆盖 DATASET_CONFIG 的参数
             "source_type": "huggingface_dataset",
             "hf_dataset_name": "wikitext",
             "hf_dataset_config_name": "wikitext-103-raw-v1", # 使用小数据集
-            "hf_split": "train[:1%]", # 只用训练集的前10%
+            "hf_split": "train[:5%]", # 只用训练集的前10%
             "hf_text_column": "text",
-            "max_samples_to_load": 200,  # 大幅减少样本量，增加重复性
-            "min_raw_text_length": 200,    # 筛选长度适中的文本
-            "max_raw_text_length": 256,    # 原始文本的最大字符长度，用于筛选更同质化的短文本
+            "max_samples_to_load": 10,  # 大幅减少样本量，增加重复性
+            "min_raw_text_length": 128,    # 筛选长度适中的文本
+            "max_raw_text_length": 4096,    # 原始文本的最大字符长度，用于筛选更同质化的短文本
             "min_tokenized_length": 128,
             "max_tokenized_length": 256,   # 使用较短且固定的分块长度
             "stride_for_chunking": 128,     # 较大的重叠，增加数据片段间的相似性
-            "prompt_min_len_ratio": 0.4,   # prompt比例可以稍大，让上下文更固定
-            "prompt_max_len_ratio": 0.6,
+            "prompt_min_len_ratio": 0.3,   # prompt比例可以稍大，让上下文更固定
+            "prompt_max_len_ratio": 0.5,
         },
         "training_params_override": { # 覆盖 TRAINING_PARAMS 的参数
-            "COMPRESSOR_LEARNING_RATE": 0.0001, # 第一阶段可以使用稍高或不同的学习率
-            "KL_TEMPERATURE": 1.5,           # 可以用稍高的温度使目标分布更平滑
-            "MAX_TOKENS_PER_EPISODE": 128,    # 每个文本块续写的token数可以少一些
+            "COMPRESSOR_LEARNING_RATE": 0.001, # 第一阶段可以使用稍高或不同的学习率
+            "KL_TEMPERATURE": 2,           # 可以用稍高的温度使目标分布更平滑
+            "MAX_TOKENS_PER_EPISODE": 5,    # 每个文本块续写的token数可以少一些
         }
     },
 
@@ -106,9 +111,9 @@ TRAINING_PARAMS["curriculum_learning_config"] = CURRICULUM_LEARNING_CONFIG
 
 # LLM 相关配置 (保持不变)
 LLM_CONFIG = {
-    "model_name_or_path": "/root/autodl-tmp/tinyllama",
-    "tokenizer_name_or_path": "/root/autodl-tmp/tinyllama",
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "model_name_or_path": "/raid_sdh/home/xyg/PRETRAINED_MODEL/TinyLlama",
+    "tokenizer_name_or_path": "/raid_sdh/home/xyg/PRETRAINED_MODEL/TinyLlama",
+    "device": "cuda:5" if torch.cuda.is_available() else "cpu",
     # "device": "cpu",
     "max_new_tokens_per_llm_step": TRAINING_PARAMS["TOKENS_TO_GENERATE_PER_STEP"], # 与上面同步
     "max_context_length_for_llm_input": TRAINING_PARAMS["IDEAL_TOTAL_CONTEXT_LENGTH"],

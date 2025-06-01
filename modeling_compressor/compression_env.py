@@ -118,10 +118,15 @@ class CompressionEnv:
                 text_col = self.dataset_args["hf_text_column"]
                 
                 if min_raw_len > 0 or max_raw_len != float('inf'):
+                    original_num_examples = len(raw_dataset)
                     raw_dataset = raw_dataset.filter(
-                        lambda ex: min_raw_len <= len(ex[text_col]) <= max_raw_len
-                    )
+                        lambda ex: isinstance(ex[text_col], str) and min_raw_len <= len(ex[text_col]) <= max_raw_len
+                    ) # 添加 isinstance 检查
+                    print(f"  Filtered raw dataset from {original_num_examples} to {len(raw_dataset)} based on raw char length [{min_raw_len}, {max_raw_len}].")
 
+                if len(raw_dataset) == 0:
+                    print("  Raw dataset is empty after filtering by character length. No chunks will be generated.")
+            
                 # 分块和Tokenize
                 chunk_size = self.dataset_args.get("max_tokenized_length", 512)
                 stride = self.dataset_args.get("stride_for_chunking", chunk_size // 2)
@@ -255,19 +260,62 @@ class CompressionEnv:
             else:
                 self.ema_logits_ref = None # 如果预填充没有产生有效logits
         
-    def _calculate_loss(self, logits_compressed: torch.Tensor, logits_ref: torch.Tensor) -> torch.Tensor: # (保持不变)
-        loss_type = self.training_params.get("LOSS_FUNCTION", "KL").upper()
+    def _calculate_loss(self, logits_compressed: torch.Tensor, logits_ref: torch.Tensor) -> torch.Tensor:
+        """
+        计算压缩logits与参考logits之间的损失，基于Top-K匹配。
+        """
+        loss_type = self.training_params.get("LOSS_FUNCTION", "TOP_K_KL").upper()
+        top_k = self.training_params.get("TOP_K_LOGITS", 10) # 从配置获取K值
+        temperature = self.training_params.get("KL_TEMPERATURE", 1.0) # 温度参数
+
+        # 确保参考logits不参与梯度计算
         logits_ref_detached = logits_ref.detach()
-        if loss_type == "KL":
-            kl_temp = self.training_params.get("KL_TEMPERATURE", 1.0)
-            log_probs_compressed = F.log_softmax(logits_compressed / kl_temp, dim=-1)
-            probs_ref = F.softmax(logits_ref_detached / kl_temp, dim=-1)
-            loss = F.kl_div(log_probs_compressed, probs_ref, reduction='batchmean', log_target=False)
-        elif loss_type == "MSE":
-            loss = F.mse_loss(logits_compressed, logits_ref_detached)
-        else:
-            raise ValueError(f"Unsupported loss function type: {loss_type}")
+
+        # 1. 对参考logits进行softmax并获取Top-K
+        probs_ref_full = F.softmax(logits_ref_detached / temperature, dim=-1)
+        top_k_probs_ref_values, top_k_indices_ref = torch.topk(probs_ref_full, k=top_k, dim=-1, sorted=True)
+        # 2. 对压缩logits进行softmax
+        probs_compressed_full = F.softmax(logits_compressed / temperature, dim=-1)
+
+        # 3. 从压缩logits的概率分布中，根据参考logits的Top-K索引，提取对应的概率值
+        batch_size = probs_compressed_full.shape[0]
+        if batch_size == 1: # 常见情况
+            probs_compressed_selected_for_top_k_ref = probs_compressed_full[0, top_k_indices_ref[0]]
+            probs_compressed_selected_for_top_k_ref = probs_compressed_selected_for_top_k_ref.unsqueeze(0) # 恢复batch维度
+        else: # 处理 batch_size > 1 的情况
+            probs_compressed_selected_for_top_k_ref = torch.gather(
+                probs_compressed_full, 
+                dim=1, # 在 vocab_size 维度上 gather
+                index=top_k_indices_ref
+            )
+        # 4. 计算损失
+        if loss_type == "TOP_K_KL":
+            epsilon_norm = 1e-9
+            norm_top_k_probs_ref = top_k_probs_ref_values / (torch.sum(top_k_probs_ref_values, dim=-1, keepdim=True) + epsilon_norm)
+            norm_probs_compressed_selected = probs_compressed_selected_for_top_k_ref / (torch.sum(probs_compressed_selected_for_top_k_ref, dim=-1, keepdim=True) + epsilon_norm)
+            
+            log_norm_probs_compressed_selected = torch.log(norm_probs_compressed_selected + epsilon_norm)
+            
+            loss = F.kl_div(log_norm_probs_compressed_selected, norm_top_k_probs_ref, 
+                            reduction='batchmean', log_target=False) # log_target=False因为norm_top_k_probs_ref是概率
+
+        elif loss_type == "TOP_K_MSE":
+            # 直接在选出的Top-K概率上计算MSE
+            loss = F.mse_loss(probs_compressed_selected_for_top_k_ref, top_k_probs_ref_values)
+        
+        elif loss_type == "TOP_K_CROSS_ENTROPY": # 这种方式可能更常用
+            print(f"Warning: TOP_K_CROSS_ENTROPY not fully implemented in this simplified Top-K. Falling back to TOP_K_MSE.")
+            loss = F.mse_loss(probs_compressed_selected_for_top_k_ref, top_k_probs_ref_values)
+
+        else: # 如果LOSS_FUNCTION不是上面明确处理的Top-K类型，但包含了TOP_K字样，则报错或默认
+            if "TOP_K" in loss_type:
+                print(f"Warning: Unsupported TOP_K loss type: {loss_type}. Defaulting to TOP_K_MSE.")
+                loss = F.mse_loss(probs_compressed_selected_for_top_k_ref, top_k_probs_ref_values)
+            else: # 如果是原始的 "KL" 或 "MSE" (整个分布)
+                raise ValueError(f"Loss function {loss_type} called in Top-K loss calculation. Ensure LOSS_FUNCTION in config is a TOP_K type.")
+        
         return loss
+
 
     def _calculate_logits_entropy(self, logits: Optional[torch.Tensor]) -> float: # (保持不变)
         if logits is None or logits.numel() == 0: return -1.0
