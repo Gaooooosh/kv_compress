@@ -325,98 +325,138 @@ class CompressionEnv:
         return entropy.mean().item()
 
     def generate_one_step(self) -> Optional[Tuple[torch.Tensor, bool, Dict[str, Any]]]:
-        """环境执行一步生成，返回损失、是否结束、信息字典"""
         if self._current_segment_processed_tokens >= len(self._current_text_segment_token_ids):
-            # print("Current text segment exhausted in env.generate_one_step. Resetting.")
-            self.reset() # 如果当前文本段已处理完，则加载新的
-            if self._current_segment_processed_tokens >= len(self._current_text_segment_token_ids): # 再次检查，防止空数据集
-                # print("ERROR: Dataset seems to provide empty segments consistently after reset.")
+            self.reset()
+            if self._current_segment_processed_tokens >= len(self._current_text_segment_token_ids):
                 return torch.tensor(0.0, device=self.device, requires_grad=False), True, {"error": "Empty segment after reset"}
 
-
-        # 获取当前LLM的输入token (通常是上一个生成的token，或者文本段中的下一个真实token)
-        # 为了与参考路径对齐，我们从 self._current_text_segment_token_ids 中取下一个token作为输入
         current_input_token_id = self._current_text_segment_token_ids[self._current_segment_processed_tokens]
         current_input_ids = torch.tensor([[current_input_token_id]], dtype=torch.long, device=self.device)
         attention_mask = torch.ones_like(current_input_ids)
 
-        # --- 主LLM (使用CompCache) ---
-        logits_compressed: Optional[torch.Tensor] = None
-        
-        try:
-            with torch.set_grad_enabled(True): 
-                self.llm_model.eval()
-                for param in self.comp_cache.k_compressor.parameters(): param.requires_grad = True
-                for param in self.comp_cache.v_compressor.parameters(): param.requires_grad = True
-
-                outputs_main = self.llm_model(
-                    input_ids=current_input_ids,
-                    attention_mask=attention_mask,
-                    past_key_values=self.comp_cache,
-                    use_cache=True, return_dict=True
-                )
-                logits_compressed = outputs_main.logits[:, -1, :] # Logits for the token *after* current_input_token_id
-        except Exception as e:
-            print(f"Error during Main LLM forward: {e}")
-            return None, True, {"error": str(e)}
-
-
-        # --- 参考LLM (无压缩) ---
+        # --- 1. 参考LLM路径 (获取 logits_ref 和更新参考KV缓存) ---
         logits_ref: Optional[torch.Tensor] = None
+        newly_generated_token_ref: Optional[int] = None # 用于日志
         try:
             with torch.no_grad():
                 self.llm_model.eval()
                 outputs_ref = self.llm_model(
                     input_ids=current_input_ids,
                     attention_mask=attention_mask,
-                    past_key_values=self._past_key_values_ref,
+                    past_key_values=self._past_key_values_ref, 
                     use_cache=True, return_dict=True
                 )
                 logits_ref = outputs_ref.logits[:, -1, :]
                 self._past_key_values_ref = outputs_ref.past_key_values
-
-                # --- 更新EMA平滑参考Logits ---
-                if logits_ref is not None and logits_ref.numel() > 0:
+                if logits_ref is not None: # 更新EMA也在这里
                     current_logits_ref_detached = logits_ref.detach().clone()
-                    if self.ema_logits_ref is None: # 如果是reset后的第一步（或预填充未初始化）
+                    if self.ema_logits_ref is None:
                         self.ema_logits_ref = current_logits_ref_detached
                     else:
                         self.ema_logits_ref = self.ema_alpha * current_logits_ref_detached + \
                                              (1.0 - self.ema_alpha) * self.ema_logits_ref
+            next_token_id_ref_tensor = torch.argmax(logits_ref.detach(), dim=-1) if logits_ref is not None else torch.tensor(-1)
+            # newly_generated_token_ref = next_token_id_ref_tensor.item()
         except Exception as e:
             print(f"Error during Reference LLM forward: {e}")
             return None, True, {"error_ref": str(e)}
 
-        # 更新已处理的token计数和总生成token计数
-        self._current_segment_processed_tokens += 1
-        self._current_episode_total_tokens_generated += 1 # LLM尝试生成了一个新token
+        # --- 2. 主LLM路径 ---
+        # 确保K和V压缩器参数在进行任何操作前都是可训练的（如果之前被冻结过）
+        # 这个操作在 train_script.py 的循环开始处已经做了，这里可以省略，
+        # 因为 generate_one_step 不应该负责这个全局状态。
+        # set_requires_grad(self.comp_cache.k_compressor, True)
+        # set_requires_grad(self.comp_cache.v_compressor, True)
 
-        # --- 固定规则触发全局压缩 ---
+        logits_compressed: Optional[torch.Tensor] = None
+        newly_generated_token_main: Optional[int] = None
+        
+        # 2.A. 让主LLM（带CompCache）的forward隐式调用CompCache.update，
+        #      以将当前 current_input_ids 对应的（未压缩）KV添加到CompCache中。
+        #      这次调用不直接用于loss的logits，主要目的是更新CompCache的内部状态。
+        #      为了避免干扰后续的梯度计算，这次可以放在no_grad下，或者我们接受它构建的图。
+        #      如果放在no_grad下，那么CompCache.update中的key_states就没有梯度信息。
+        #      更优的做法是让它在grad_enabled下进行，但我们不使用它的logits输出。
+        try:
+            with torch.set_grad_enabled(True): # 保持梯度追踪，因为update会修改参与后续计算的缓存
+                self.llm_model.eval()
+                # 确保压缩器参数是可训练的，以便后续压缩能构建图
+                for param in self.comp_cache.k_compressor.parameters(): param.requires_grad = True
+                for param in self.comp_cache.v_compressor.parameters(): param.requires_grad = True
+
+                # 第一次forward，主要是为了CompCache.update被调用
+                # 其输出的past_key_values就是更新后的self.comp_cache
+                _ = self.llm_model( 
+                    input_ids=current_input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=self.comp_cache, # 传入当前的CompCache
+                    use_cache=True, return_dict=True 
+                )
+                # 此调用后，self.comp_cache (通过其update方法) 已包含current_input_ids的KV
+        except Exception as e:
+            print(f"Error during Main LLM pre-update forward: {e}")
+            return None, True, {"error_main_pre_update": str(e)}
+
+        # 2.B. 根据固定规则和更新后的CompCache状态，决定是否触发压缩
         compression_triggered_this_step = False
-        compression_performed_this_step = False
-        # （压缩触发逻辑与之前版本类似，检查 compress_layer_ids 中是否有层达到阈值）
         for layer_idx_check in self.comp_cache.config.compress_layer_ids:
             if layer_idx_check < len(self.comp_cache.key_cache) and \
-               self.comp_cache.key_cache[layer_idx_check].ndim == 4: # 确保层缓存已初始化
+               self.comp_cache.key_cache[layer_idx_check].ndim == 4:
                 layer_total_len = self.comp_cache.key_cache[layer_idx_check].shape[-2]
                 if (layer_total_len - self.initial_keep_len) >= self.compression_trigger_threshold:
                     compression_triggered_this_step = True
                     break
+        
+        compression_performed_this_step = False
         if compression_triggered_this_step:
-            compression_performed_this_step = self.comp_cache.trigger_global_compression()
+            with torch.set_grad_enabled(True): # 确保压缩操作在梯度追踪下
+                 # KVCompressor参数的requires_grad已在上面或外部设为True
+                 compression_performed_this_step = self.comp_cache.trigger_global_compression()
+                 # trigger_global_compression 调用 KVCompressor.forward()
+                 # 并用其输出更新 self.comp_cache.key_cache 和 value_cache
+                 # 这些更新后的缓存张量现在连接到了KVCompressor的参数
+        
+        # 2.C. 主LLM再次（或主要的一次）forward，以获取受当前步骤压缩决策影响的 logits_compressed
+        try:
+            with torch.set_grad_enabled(True): 
+                self.llm_model.eval()
+                # KVCompressor参数的requires_grad应已正确设置
+                outputs_main_final = self.llm_model(
+                    input_ids=current_input_ids, # 仍然是本步骤的输入token
+                    attention_mask=attention_mask,
+                    past_key_values=self.comp_cache, # 使用当前（在update和可能压缩之后）的CompCache
+                    use_cache=True, # 让CompCache再次被update (这次主要是为了获取logits)
+                    return_dict=True
+                )
+                logits_compressed = outputs_main_final.logits[:, -1, :]
+            
+            next_token_id_main_tensor = torch.argmax(logits_compressed.detach(), dim=-1) if logits_compressed is not None else torch.tensor(-1)
+            newly_generated_token_main = next_token_id_main_tensor.item()
+        except Exception as e:
+            print(f"Error during Main LLM final forward: {e}")
+            return None, True, {"error_main_final_forward": str(e)}
+
+        # --- 更新对话历史和计数器 ---
+        if newly_generated_token_main is not None and newly_generated_token_main != -1:
+            pass # 不再需要追加到 _current_dialogue_token_ids 或 _current_text_segment_token_ids
+        self._current_segment_processed_tokens += 1
+        self._current_episode_total_tokens_generated += 1
 
         # --- 计算损失 ---
-        loss = torch.tensor(0.0, device=self.device) 
-        # 使用平滑后的 ema_logits_ref 进行损失计算
-        if logits_compressed is not None and self.ema_logits_ref is not None: # <--- 使用 self.ema_logits_ref
-            loss = self._calculate_loss(logits_compressed, self.ema_logits_ref) # <--- 传递 self.ema_logits_ref
+        loss = torch.tensor(0.0, device=self.device, requires_grad=False) # 默认无梯度
+        if logits_compressed is not None and self.ema_logits_ref is not None:
+            # _calculate_loss的输出应该是一个需要梯度的标量
+            calculated_loss = self._calculate_loss(logits_compressed, self.ema_logits_ref)
+            loss = calculated_loss 
         elif logits_compressed is not None and logits_ref is not None and self.ema_logits_ref is None:
-            # Fallback to instantaneous logits_ref if ema is somehow still None (should not happen after reset)
-            print("Warning: ema_logits_ref is None, falling back to instantaneous logits_ref for loss calculation.")
+            print("Warning: ema_logits_ref is None, falling back to instantaneous logits_ref for loss.")
             loss = self._calculate_loss(logits_compressed, logits_ref)
         else:
-            print("Warning: Logits missing (compressed or reference), loss set to 0 for this step.")
-
+            print("Warning: Logits missing for loss calculation.")
+            # 如果希望出错时有惩罚或可反向传播的0，需要 loss = torch.tensor(VALUE, device=self.device, requires_grad=True)
+            # 但如果是因为错误，可能不应该反向传播。
+            # 对于不收敛，如果这里返回的loss不带梯度，那参数永远不会更新。
+            # 确保_calculate_loss返回的张量有grad_fn
 
         done = self._current_episode_total_tokens_generated >= self.training_params["MAX_TOKENS_PER_EPISODE"]
         
