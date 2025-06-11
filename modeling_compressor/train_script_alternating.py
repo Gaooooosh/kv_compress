@@ -11,9 +11,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 # 导入配置和自定义模块
 from config_rl import TRAINING_PARAMS, LLM_CONFIG, DEFAULT_COMPRESSOR_CONFIG_PARAMS, DATASET_CONFIG, CURRICULUM_LEARNING_CONFIG #
-from untis import CompressorConfig #
+from untils import CompressorConfig #
 from compression_env import CompressionEnv #
-# model.py 和 CCache.py 会被 compression_env.py 和 CompressorConfig 间接使用
 
 def plot_losses(step_losses: List[float], save_path: str = "training_losses.png", window_size: int = 100, stage_num: Optional[int] = None, title_suffix: str = ""): #
     """绘制训练损失曲线和滑动平均损失曲线"""
@@ -279,34 +278,40 @@ def main_compressor_training_loop():
                     # --- 严格交替训练的优化步骤 ---
                     if train_k_this_step:
                         set_requires_grad(environment.comp_cache.k_compressor, True)
-                        set_requires_grad(environment.comp_cache.v_compressor, False) # 冻结V
+                        set_requires_grad(environment.comp_cache.v_compressor, False)
                         k_optimizer.zero_grad()
-                        loss_tensor.backward() # 梯度只会计算并填充到K的参数上
-                        if current_stage_training_params.get("GRADIENT_CLIP_NORM", 0) > 0:
-                            torch.nn.utils.clip_grad_norm_(k_params, current_stage_training_params["GRADIENT_CLIP_NORM"])
-                        k_optimizer.step()
-                        if lr_scheduler_k: lr_scheduler_k.step()
-                    
+                        loss_tensor.backward()
+                        k_conv1_weight = environment.comp_cache.k_compressor.conv1.weight
+                        # print(f"  K_Compressor conv1.weight: requires_grad={k_conv1_weight.requires_grad}, grad_fn={k_conv1_weight.grad_fn}, is_leaf={k_conv1_weight.is_leaf}")
+
                     elif train_v_this_step:
-                        set_requires_grad(environment.comp_cache.k_compressor, False) # 冻结K
+                        set_requires_grad(environment.comp_cache.k_compressor, False)
                         set_requires_grad(environment.comp_cache.v_compressor, True)
                         v_optimizer.zero_grad()
-                        loss_tensor.backward() # 梯度只会计算并填充到V的参数上
-                        if current_stage_training_params.get("GRADIENT_CLIP_NORM", 0) > 0:
-                            torch.nn.utils.clip_grad_norm_(v_params, current_stage_training_params["GRADIENT_CLIP_NORM"])
-                        v_optimizer.step()
-                        if lr_scheduler_v: lr_scheduler_v.step()
-                    
-                    # 注意：loss_tensor.backward() 在这里只被调用一次（或者在K的块，或者在V的块）。
-                    # 计算图在 backward() 后默认会释放。这是正确的。
-                    # 下一步的 loss_tensor 会重新构建图。
-                    # --- 交替训练优化步骤结束 ---
+                        loss_tensor.backward()
+                        v_conv1_weight = environment.comp_cache.v_compressor.conv1.weight
+
+                    print_grad_this_step = (current_global_step % current_stage_training_params.get("LOG_FREQ_STEPS", 100) == 0) # 例如每LOG_FREQ_STEPS打印一次梯度
+                    if print_grad_this_step:
+                        print(f"    DEBUG GRADS for Step {current_global_step} (Training {'K' if train_k_this_step else 'V'}):")
+                        compressor_to_check = environment.comp_cache.k_compressor if train_k_this_step else environment.comp_cache.v_compressor
+                        for name, param in compressor_to_check.named_parameters():
+                            if param.grad is not None:
+                                grad_abs_mean = param.grad.abs().mean().item()
+                                grad_abs_max = param.grad.abs().max().item()
+                                print(f"      Param: {name:<30} | Grad Mean Abs: {grad_abs_mean:.2e} | Grad Max Abs: {grad_abs_max:.2e}")
+                                if grad_abs_mean == 0.0 and grad_abs_max == 0.0:
+                                    print(f"      WARNING: Grad for {name} is all zeros.")
+                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                    print(f"      WARNING: Grad for {name} contains NaN or Inf!")
+                                break
+                            else:
+                                print(f"      Param: {name:<30} | Grad: None (Likely frozen or not in graph)")
             
             elif loss_tensor is not None: 
                  current_loss_value = loss_tensor.item()
 
             all_step_losses_overall.append(current_loss_value)
-            # ... (TensorBoard 日志) ...
             writer.add_scalar(f'Loss/step_stage_{stage_num}', current_loss_value, current_global_step)
             writer.add_scalar('Loss/step_overall', current_loss_value, current_global_step)
             if k_optimizer: writer.add_scalar('LearningRate/k_compressor', k_optimizer.param_groups[0]['lr'], current_global_step) #

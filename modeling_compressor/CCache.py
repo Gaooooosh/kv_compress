@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from transformers import DynamicCache
 
-from untis import CompressorConfig
+from untils import CompressorConfig
 from model import KVCompressor
 
 class CacheProcessor(nn.Module):
@@ -306,19 +306,19 @@ class CompCache(DynamicCache):
         if not list_of_new_k_segments or not list_of_new_v_segments or \
            len(list_of_new_k_segments) != len(participating_layer_indices) or \
            list_of_new_k_segments[0].shape[-2] == 0: # 检查压缩器是否有有效输出
-            # print("DEBUG Global: Compressor output is empty or layer count mismatch. Effective segment removal.")
+            print("DEBUG Global: Compressor output is empty or layer count mismatch. Effective segment removal.")
             # 即使压缩输出为空，我们也要从原始层中移除被“消耗”的段
             for idx, original_layer_idx in enumerate(participating_layer_indices):
                 current_k_layer = self.key_cache[original_layer_idx]
                 current_v_layer = self.value_cache[original_layer_idx]
                 
                 segment_end_idx = initial_keep_len + segment_len_to_compress
-                head_k_part = current_k_layer[:, :, :initial_keep_len, :]
-                tail_k_part = current_k_layer[:, :, segment_end_idx:, :]
+                head_k_part = current_k_layer[:, :, :initial_keep_len, :].detach().clone() # Detach 历史部分
+                tail_k_part = current_k_layer[:, :, segment_end_idx:, :].detach().clone() # Detach 历史部分
                 self.key_cache[original_layer_idx] = torch.cat([head_k_part, tail_k_part], dim=-2)
                 
-                head_v_part = current_v_layer[:, :, :initial_keep_len, :]
-                tail_v_part = current_v_layer[:, :, segment_end_idx:, :]
+                head_v_part = current_v_layer[:, :, :initial_keep_len, :].detach().clone() # Detach 历史部分
+                tail_v_part = current_v_layer[:, :, segment_end_idx:, :].detach().clone() # Detach 历史部分
                 self.value_cache[original_layer_idx] = torch.cat([head_v_part, tail_v_part], dim=-2)
             actual_compression_performed = True # 认为进行了一次操作（即使是删除）
             return actual_compression_performed
@@ -331,21 +331,15 @@ class CompCache(DynamicCache):
 
             current_k_layer = self.key_cache[original_layer_idx] # 这是压缩操作前的状态
             current_v_layer = self.value_cache[original_layer_idx]
-            
-            # head_part 和 tail_part 是历史KV，它们不应该将梯度带到当前压缩操作中
-            # 也不应该从当前压缩操作接收梯度后影响到之前的计算图（如果它们源自之前的压缩）
-            # 当它们与新的压缩段 new_k_seg_for_layer 拼接时，
-            # 为了避免计算图混淆，对它们进行 detach 是安全的，因为梯度不应流过它们到更早的步骤。
-            head_k_part = current_k_layer[:, :, :initial_keep_len, :].detach().clone() # Detach 历史部分
-            head_v_part = current_v_layer[:, :, :initial_keep_len, :].detach().clone() # Detach 历史部分
+            head_k_part = current_k_layer[:, :, :initial_keep_len, :]
+            head_v_part = current_v_layer[:, :, :initial_keep_len, :]
             
             segment_end_idx_original = initial_keep_len + segment_len_to_compress
-            tail_k_part = current_k_layer[:, :, segment_end_idx_original:, :].detach().clone() # Detach 历史部分
-            tail_v_part = current_v_layer[:, :, segment_end_idx_original:, :].detach().clone() # Detach 历史部分
+            tail_k_part = current_k_layer[:, :, segment_end_idx_original:, :]
+            tail_v_part = current_v_layer[:, :, segment_end_idx_original:, :]
             
             self.key_cache[original_layer_idx] = torch.cat([head_k_part, new_k_seg_for_layer, tail_k_part], dim=-2)
             self.value_cache[original_layer_idx] = torch.cat([head_v_part, new_v_seg_for_layer, tail_v_part], dim=-2)
-            # print(f"DEBUG Global: Layer {original_layer_idx} updated with compressed segment. New len: {self.key_cache[original_layer_idx].shape[-2]}")
 
         return actual_compression_performed
 
