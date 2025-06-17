@@ -10,29 +10,29 @@ TRAINING_PARAMS = {
     "MIN_UNCOMPRESSED_CONTEXT_LENGTH": 1980, # 奖励函数中可能用到的参考值（当前极简版奖励简单）
     
     # 模拟LLM新token流入的参数 (在Environment中使用)
-    "TOKENS_TO_GENERATE_PER_STEP": 1, # 环境每一步让LLM生成多少个新token
+    "TOKENS_TO_GENERATE_PER_STEP": 2, # 环境每一步让LLM生成多少个新token
                                          # 为了精确对比logits，通常设为1
     "USE_LR_SCHEDULER":True,
-    "LR_SCHEDULER_STEP_SIZE":5000,
-    "LR_SCHEDULER_GAMMA":0.5,
+    "LR_SCHEDULER_STEP_SIZE":1000,
+    "LR_SCHEDULER_GAMMA":0.7,
     # KVCompressor 训练相关参数
-    "COMPRESSOR_LEARNING_RATE": 0.0002,   # KVCompressor的学习率
+    "COMPRESSOR_LEARNING_RATE": 0.000001,   # KVCompressor的学习率
     "LOSS_FUNCTION": "TOP_K_KL",  # "TOP_K_KL"、"TOP_K_MSE"
     "KL_TEMPERATURE": 1.0,              # KL散度中softmax的温度参数（如果需要调整）
     "TOP_K_LOGITS": 10,           # only for TOP_K_KL 选择 Top-K 个 logits 进行比较，例如 K=10
     "KL_TEMPERATURE": 1.0,        # 保持，因为Top-K KL仍然可以用到
     "ACCUMULATION_STEPS" : 10,
-    "EMA_ALPHA_LOGITS_REF": 0.1,
+    # "EMA_ALPHA_LOGITS_REF": 0.1,
     # 训练过程相关参数
     "NUM_TRAINING_STEPS": 50000,          # 总训练步数 (替代 NUM_EPISODES)
     "MAX_TOKENS_PER_EPISODE": 128,       # 每个“回合”或数据段处理的最大token数量 (用于reset环境)
-    "COMPRESSOR_MODEL_SAVE_FREQ_STEPS": 10000, # 每多少步保存一次压缩器模型
+    "COMPRESSOR_MODEL_SAVE_FREQ_STEPS": 20000, # 每多少步保存一次压缩器模型
     "LOG_FREQ_STEPS": 100,                 # 每多少步打印一次日志
     "GRADIENT_CLIP_NORM": 0.0,            # 梯度裁剪的范数 (0表示不裁剪)
     "ALTERNATING_TRAINING_MODE": "block", # "block" (每N步切换) 或 "step" (每步轮流)
-    "ALTERNATING_BLOCK_SIZE": 5000,        # 如果 mode="block", 每多少步切换一次训练K还是V
-    "MODEL_SAVE_DIR":"/raid_sdh/home/xyg/compressor_training_output_dataset"
-    # "LOAD_PRETRAINED_COMPRESSOR_PATH":""
+    "ALTERNATING_BLOCK_SIZE": 2000,        # 如果 mode="block", 每多少步切换一次训练K还是V
+    "MODEL_SAVE_DIR":"/raid_sdh/home/xyg/compressor_training_output_dataset",
+    # "LOAD_PRETRAINED_COMPRESSOR_PATH":"/raid_sdh/home/xyg/compressor_training_output_dataset/kv_compressor_alt_final_overall.pth"
 }
 
 DATASET_CONFIG = {
@@ -40,7 +40,7 @@ DATASET_CONFIG = {
     "dataset_config_name": "wikitext-103-raw-v1", # 数据集子配置, e.g., "wikitext-103-raw-v1", "en" for c4
     "text_column": "text",              # 数据集中包含文本的列名
     "split": "train",                   # 使用哪个数据分割, e.g., "train", "validation"
-    "max_samples_to_load": 10000,       # 加载的最大样本数量，用于限制数据集大小
+    "max_samples_to_load": 15000,       # 加载的最大样本数量，用于限制数据集大小
     "min_text_length_for_sample": 256,  # 采样文本的最小长度 (tokenized)
     "max_text_length_for_sample": 1024, # 采样文本的最大长度 (tokenized) - 用于分段处理长文本
     "max_token_ized_length": TRAINING_PARAMS.get("IDEAL_TOTAL_CONTEXT_LENGTH", 512), # 使用理想上下文长度作为分块大小
@@ -60,15 +60,12 @@ CURRICULUM_LEARNING_CONFIG = {
         "enabled": True, # 是否启用第一阶段
         "duration_steps": 20000,  # 第一阶段持续的训练步数
         "dataset_args_override": { # 覆盖 DATASET_CONFIG 的参数
-            # "source_type": "huggingface_dataset",
-            "source_type": "fixed_list",
-            "fixed_texts":["Zeng Laishun was born around 1826 or 1827 in Singapore. His father was a Teochew migrant from eastern Guangdong, a province of southern China, and his mother was Malay. Zeng was brought up mainly speaking Malay. Both of his parents worked as vegetable farmers, and died when he was a young child. Orphaned, he was sent to work serving tables at the American Consulate. There, in 1836, he was noticed by American Board of Commissioners for Foreign Missions missionary Joseph Travelli, who had him enrolled in a Chinese day school established by his colleague Ira Tracy the previous year. The school's missionaries referred to him as \"Chan Laisun\".Around April 1843, Zeng was sent to the United States to continue his education. He was accompanied by the Presbyterian missionary John Hunter Morrison, who was returning to America after work in northern India. They went west via the Indian and Atlantic oceans, sailing around the Cape of Good Hope to dock on the east coast of the country. Morrison raised funds from among his friends and enrolled Zeng in the Bloomfield Academy, a boarding school in Bloomfield, New Jersey. Morrison returned to India in 1846, and Zeng was put into the care of an American Board missionary previously stationed in Guangzhou, Samuel Wells Williams. In the fall of 1846, Zeng transferred from Bloomfield to Hamilton College, a Presbyterian institution in Clinton, New York. Williams arranged for the First Presbyterian Church in Utica, New York, to support Zeng's study for two years, the \"faculty offering to teach him gratuitously, and the ladies in Brooklyn to clothe him.\".According to historian Edward J. M. Rhoads, Zeng was the first Chinese person to attend college in the United States, and possibly the first at any foreign college. At Hamilton, Zeng studied the New Testament in Koine Greek (likely under classicist Edward North) and taught Sunday school at a local church. He was active in the college's glee club. In early 1848, his funding ran out, and he was forced to withdraw from the college. Williams attempted to arrange for the American Board to take Zeng to China to work as a teacher at their mission in Xiamen, but the American Board refused, stating that it was the Presbyterian Church's responsibility to transport him, and that foreign-educated Chinese Christians were unsuitable for mission work. Instead, he traveled to China with Williams and his wife, departing from New York City in late May 1848.Zeng Laishun was born around 1826 or 1827 in Singapore. His father was a Teochew migrant from eastern Guangdong, a province of southern China, and his mother was Malay. Zeng was brought up mainly speaking Malay. Both of his parents worked as vegetable farmers, and died when he was a young child. Orphaned, he was sent to work serving tables at the American Consulate. There, in 1836, he was noticed by American Board of Commissioners for Foreign Missions missionary Joseph Travelli, who had him enrolled in a Chinese day school established by his colleague Ira Tracy the previous year. The school's missionaries referred to him as \"Chan Laisun\".Around April 1843, Zeng was sent to the United States to continue his education. He was accompanied by the Presbyterian missionary John Hunter Morrison, who was returning to America after work in northern India. They went west via the Indian and Atlantic oceans, sailing around the Cape of Good Hope to dock on the east coast of the country. Morrison raised funds from among his friends and enrolled Zeng in the Bloomfield Academy, a boarding school in Bloomfield, New Jersey. Morrison returned to India in 1846, and Zeng was put into the care of an American Board missionary previously stationed in Guangzhou, Samuel Wells Williams. In the fall of 1846, Zeng transferred from Bloomfield to Hamilton College, a Presbyterian institution in Clinton, New York. Williams arranged for the First Presbyterian Church in Utica, New York, to support Zeng's study for two years, the \"faculty offering to teach him gratuitously, and the ladies in Brooklyn to clothe him.\".According to historian Edward J. M. Rhoads, Zeng was the first Chinese person to attend college in the United States, and possibly the first at any foreign college. At Hamilton, Zeng studied the New Testament in Koine Greek (likely under classicist Edward North) and taught Sunday school at a local church. He was active in the college's glee club. In early 1848, his funding ran out, and he was forced to withdraw from the college. Williams attempted to arrange for the American Board to take Zeng to China to work as a teacher at their mission in Xiamen, but the American Board refused, stating that it was the Presbyterian Church's responsibility to transport him, and that foreign-educated Chinese Christians were unsuitable for mission work. Instead, he traveled to China with Williams and his wife, departing from New York City in late May 1848."],
-            "fixed_list_repeat":5000,
+            "source_type": "huggingface_dataset",
             "hf_dataset_name": "wikitext",
             "hf_dataset_config_name": "wikitext-103-raw-v1", # 使用小数据集
             "hf_split": "train[:5%]", # 只用训练集的前10%
             "hf_text_column": "text",
-            "max_samples_to_load": 1,  # 大幅减少样本量，增加重复性
+            "max_samples_to_load": 10,  # 大幅减少样本量，增加重复性
             "min_raw_text_length": 128,    # 筛选长度适中的文本
             "max_raw_text_length": 4096,    # 原始文本的最大字符长度，用于筛选更同质化的短文本
             "min_tokenized_length": 128,
@@ -78,23 +75,23 @@ CURRICULUM_LEARNING_CONFIG = {
             "prompt_max_len_ratio": 0.5,
         },
         "training_params_override": { # 覆盖 TRAINING_PARAMS 的参数
-            "COMPRESSOR_LEARNING_RATE": 0.00001, # 第一阶段可以使用稍高或不同的学习率
-            "KL_TEMPERATURE": 2,           # 可以用稍高的温度使目标分布更平滑
-            "MAX_TOKENS_PER_EPISODE": 5,    # 每个文本块续写的token数可以少一些
+            "COMPRESSOR_LEARNING_RATE": 0.0001, # 第一阶段可以使用稍高或不同的学习率
+            "KL_TEMPERATURE": 1.2,           # 可以用稍高的温度使目标分布更平滑
+            "MAX_TOKENS_PER_EPISODE": 3,    # 每个文本块续写的token数可以少一些
         }
     },
 
     "stage_2": {
         # ... (第二阶段配置，可以使用 wikitext-103-raw-v1 的更大数据集和不同参数) ...
         "enabled": True,
-        "duration_steps": 40000, 
+        "duration_steps": 80000, 
         "dataset_args_override": {
             "source_type": "huggingface_dataset",
             "hf_dataset_name": "wikitext",
             "hf_dataset_config_name": "wikitext-103-raw-v1", # 第二阶段可以用更多数据
             "hf_split": "train[1%:50%]", # 例如使用1%到50%的数据
             "hf_text_column": "text",
-            "max_samples_to_load": 10000, 
+            "max_samples_to_load": 20000, 
             "min_raw_text_length": 100,
             "min_tokenized_length": 128,
             "max_tokenized_length": TRAINING_PARAMS.get("IDEAL_TOTAL_CONTEXT_LENGTH", 512),
@@ -105,7 +102,7 @@ CURRICULUM_LEARNING_CONFIG = {
         "training_params_override": {
             "COMPRESSOR_LEARNING_RATE": 0.00005, 
             "KL_TEMPERATURE": 1.0,
-            "MAX_TOKENS_PER_EPISODE": TRAINING_PARAMS.get("MAX_TOKENS_PER_EPISODE", 256),
+            "MAX_TOKENS_PER_EPISODE": 32,
         }
     }
 }
@@ -127,11 +124,12 @@ LLM_CONFIG = {
 DEFAULT_COMPRESSOR_CONFIG_PARAMS = {
     "reduction_factor": 4,
     "output_seq_len": 4,
-    "num_attention_heads": 8,
-    "use_mixed_precision": False,
+    "num_attention_heads": 32,
+    "use_mixed_precision": True,
     "torch_dtype": "torch.float32", # 将在untis.py中转换为torch.dtype对象
     "kernel_size": 3,
     "padding": 1,
+    "kv_head_dim":4,
     "compression_threshold": 64, # CompCache中判断是否压缩的阈值 (固定规则)
     "initial_uncompressed_keep_length": 8
 }

@@ -8,6 +8,7 @@ import random
 from datetime import datetime
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast
 
 # 导入配置和自定义模块
 from config_rl import TRAINING_PARAMS, LLM_CONFIG, DEFAULT_COMPRESSOR_CONFIG_PARAMS, DATASET_CONFIG, CURRICULUM_LEARNING_CONFIG #
@@ -130,8 +131,8 @@ def main_compressor_training_loop():
             cfg_kv_heads = getattr(llm_true_config, 'num_key_value_heads', llm_true_config.num_attention_heads)
             cfg_input_dim = (llm_true_config.hidden_size // llm_true_config.num_attention_heads) * cfg_kv_heads
         except Exception as e:
-            cfg_layer_nums = DEFAULT_COMPRESSOR_CONFIG_PARAMS.get("layer_nums", 2)
-            cfg_kv_heads = DEFAULT_COMPRESSOR_CONFIG_PARAMS.get("kv_head_dim", 2)
+            cfg_layer_nums = DEFAULT_COMPRESSOR_CONFIG_PARAMS.get("layer_nums", 32)
+            cfg_kv_heads = DEFAULT_COMPRESSOR_CONFIG_PARAMS.get("kv_head_dim", 4)
             cfg_input_dim = DEFAULT_COMPRESSOR_CONFIG_PARAMS.get("input_dim", 128)
 
         skip_layers_cfg = current_stage_training_params.get("skip_first_n_layers_for_compression", 
@@ -242,27 +243,28 @@ def main_compressor_training_loop():
 
         environment.reset()
         print(f"  Starting stage {stage_num} training loop for {stage_duration_steps} steps...")
-        
+        device = torch.device(LLM_CONFIG["device"]) #
+        device_type = device.type
         for step_in_stage in range(1, stage_duration_steps + 1):
             current_global_step = total_steps_overall + step_in_stage
-            
             # 1. 确保在计算loss前，两个压缩器的参数都允许计算梯度，以便loss_tensor连接到两者
             set_requires_grad(environment.comp_cache.k_compressor, True)
             set_requires_grad(environment.comp_cache.v_compressor, True)
+            with autocast(device_type,enabled=current_stage_training_params.get("use_mixed_precision", True),dtype=torch.bfloat16):
+                result = environment.generate_one_step()
+                if result is None:
+                    print(f"Warning: Stage {stage_num}, Step {step_in_stage} (Global {current_global_step}) env.generate_one_step() returned None. Resetting.")
+                    environment.reset() 
+                    continue
 
-            result = environment.generate_one_step()
-            if result is None:
-                print(f"Warning: Stage {stage_num}, Step {step_in_stage} (Global {current_global_step}) env.generate_one_step() returned None. Resetting.")
-                environment.reset() 
-                continue
-
-            loss_tensor, done, info = result
-            current_loss_value = float('nan')
+                loss_tensor, done, info = result
+                current_loss_value = float('nan')
 
             if loss_tensor is not None:
-                current_loss_value = loss_tensor.item() 
                 if loss_tensor.requires_grad:
-                    
+                    accumulation_steps = current_stage_training_params.get("ACCUMULATION_STEPS", 1)
+                    loss_tensor = loss_tensor / accumulation_steps
+                    current_loss_value = loss_tensor.item() 
                     train_k_this_step = False
                     train_v_this_step = False
                     mode = current_stage_training_params.get("ALTERNATING_TRAINING_MODE", "block")
@@ -276,37 +278,29 @@ def main_compressor_training_loop():
                         else: train_v_this_step = True
                     
                     # --- 严格交替训练的优化步骤 ---
-                    if train_k_this_step:
-                        set_requires_grad(environment.comp_cache.k_compressor, True)
-                        set_requires_grad(environment.comp_cache.v_compressor, False)
+                    k_optimizer.zero_grad()
+                    v_optimizer.zero_grad()
+                    
+                    # 2. Call backward() ONCE. This computes gradients for all parameters in the graph
+                    #    (both K and V compressors) and stores them in the .grad attribute.
+                    loss_tensor.backward()
+
+                    if (step_in_stage % accumulation_steps) == 0: 
+                        if current_stage_training_params.get("GRADIENT_CLIP_NORM", 0) > 0:
+                            torch.nn.utils.clip_grad_norm_(k_params, current_stage_training_params["GRADIENT_CLIP_NORM"])
+                            torch.nn.utils.clip_grad_norm_(v_params, current_stage_training_params["GRADIENT_CLIP_NORM"])
+
+                        if train_k_this_step:
+                            k_optimizer.step() # Apply updates to K compressor
+                            lr_scheduler_k.step()
+
+                        elif train_v_this_step:
+                            v_optimizer.step() # Apply updates to V compressor
+                            lr_scheduler_v.step()
                         k_optimizer.zero_grad()
-                        loss_tensor.backward()
-                        k_conv1_weight = environment.comp_cache.k_compressor.conv1.weight
-                        # print(f"  K_Compressor conv1.weight: requires_grad={k_conv1_weight.requires_grad}, grad_fn={k_conv1_weight.grad_fn}, is_leaf={k_conv1_weight.is_leaf}")
-
-                    elif train_v_this_step:
-                        set_requires_grad(environment.comp_cache.k_compressor, False)
-                        set_requires_grad(environment.comp_cache.v_compressor, True)
                         v_optimizer.zero_grad()
-                        loss_tensor.backward()
-                        v_conv1_weight = environment.comp_cache.v_compressor.conv1.weight
 
-                    print_grad_this_step = (current_global_step % current_stage_training_params.get("LOG_FREQ_STEPS", 100) == 0) # 例如每LOG_FREQ_STEPS打印一次梯度
-                    if print_grad_this_step:
-                        print(f"    DEBUG GRADS for Step {current_global_step} (Training {'K' if train_k_this_step else 'V'}):")
-                        compressor_to_check = environment.comp_cache.k_compressor if train_k_this_step else environment.comp_cache.v_compressor
-                        for name, param in compressor_to_check.named_parameters():
-                            if param.grad is not None:
-                                grad_abs_mean = param.grad.abs().mean().item()
-                                grad_abs_max = param.grad.abs().max().item()
-                                print(f"      Param: {name:<30} | Grad Mean Abs: {grad_abs_mean:.2e} | Grad Max Abs: {grad_abs_max:.2e}")
-                                if grad_abs_mean == 0.0 and grad_abs_max == 0.0:
-                                    print(f"      WARNING: Grad for {name} is all zeros.")
-                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                    print(f"      WARNING: Grad for {name} contains NaN or Inf!")
-                                break
-                            else:
-                                print(f"      Param: {name:<30} | Grad: None (Likely frozen or not in graph)")
+                    environment.comp_cache.detach_()
             
             elif loss_tensor is not None: 
                  current_loss_value = loss_tensor.item()

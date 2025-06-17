@@ -33,7 +33,7 @@ class CompressionEnv:
 
         self.llm_model = AutoModelForCausalLM.from_pretrained(llm_model_name_or_path)
         self.llm_model.to(self.device)
-        self.llm_model.eval()
+        # self.llm_model.eval()
         print("Main LLM Model loaded.")
 
         llm_num_layers = self.llm_model.config.num_hidden_layers
@@ -314,7 +314,7 @@ class CompressionEnv:
         try:
             # 整个主路径操作都在梯度追踪下
             with torch.set_grad_enabled(True): 
-                self.llm_model.eval() # LLM参数固定
+                # self.llm_model.eval() # LLM参数固定
                 _ = self.llm_model( 
                     input_ids=current_input_ids,
                     attention_mask=attention_mask,

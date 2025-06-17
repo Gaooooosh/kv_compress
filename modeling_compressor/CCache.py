@@ -183,22 +183,48 @@ class CompCache(DynamicCache):
                 current_v.shape[1] == num_heads and current_v.shape[3] == head_dim):
             self.value_cache[layer_idx] = torch.empty((batch_size, num_heads, 0, head_dim), dtype=dtype, device=self._device)
 
+    def detach_(self):
+        """
+        Detaches all tensors in the key and value caches from their current
+        computation graph in-place. This is used to signal to PyTorch that
+        the cache should be treated as a leaf in the next iteration.
+        """
+        for i in range(len(self.key_cache)):
+            if self.key_cache[i].requires_grad:
+                self.key_cache[i] = self.key_cache[i].detach()
+        
+        for i in range(len(self.value_cache)):
+            if self.value_cache[i].requires_grad:
+                self.value_cache[i] = self.value_cache[i].detach()
+
+    def copy(self):
+        """Creates a new CompCache with a copy of the tensor data, preserving the graph."""
+        # Create a new instance, sharing the config and compressor models
+        new_cache = CompCache(self.config, self._device)
+        new_cache.k_compressor = self.k_compressor
+        new_cache.v_compressor = self.v_compressor
+        new_cache.processor = self.processor
+        
+        # .clone() preserves the computation graph of the tensors
+        new_cache.key_cache = [k.clone() for k in self.key_cache]
+        new_cache.value_cache = [v.clone() for v in self.value_cache]
+        
+        new_cache._seen_tokens = self._seen_tokens
+        return new_cache
+
     def update( # (基本保持不变，负责追加增量)
         self,
         key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int,
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self._ensure_device_from_input(key_states) 
+        self._ensure_device_from_input(key_states)
         batch_size, num_heads, incremental_seq_len, head_dim = key_states.shape
         self._ensure_layer_cache_initialized(layer_idx, batch_size, num_heads, head_dim, key_states.dtype)
 
-        # 当拼接时，确保旧的缓存部分是分离的
-        # key_states 和 value_states (增量) 是新的，带有当前的计算图
-        old_k_cache = self.key_cache[layer_idx].detach().clone() # 分离并复制旧的缓存内容
-        old_v_cache = self.value_cache[layer_idx].detach().clone() # 分离并复制旧的缓存内容
-
-        self.key_cache[layer_idx] = torch.cat([old_k_cache, key_states], dim=-2)
-        self.value_cache[layer_idx] = torch.cat([old_v_cache, value_states], dim=-2)
+        # DO NOT detach the old cache. Allow the graph to be preserved.
+        # The graph history will be pruned selectively in trigger_global_compression.
+        self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+        self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
 
         if layer_idx == 0: self._seen_tokens += incremental_seq_len
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
@@ -326,24 +352,28 @@ class CompCache(DynamicCache):
 
         actual_compression_performed = True
         for i, original_layer_idx in enumerate(participating_layer_indices):
-            new_k_seg_for_layer = list_of_new_k_segments[i]
-            new_v_seg_for_layer = list_of_new_v_segments[i]
+            new_k_seg_for_layer = list_of_new_k_segments[i] # This tensor has the grad_fn
+            new_v_seg_for_layer = list_of_new_v_segments[i] # This tensor has the grad_fn
 
-            current_k_layer = self.key_cache[original_layer_idx] # 这是压缩操作前的状态
+            current_k_layer = self.key_cache[original_layer_idx]
             current_v_layer = self.value_cache[original_layer_idx]
-            head_k_part = current_k_layer[:, :, :initial_keep_len, :]
-            head_v_part = current_v_layer[:, :, :initial_keep_len, :]
+            
+            # Detach the head and tail parts to prune the computation graph.
+            # The gradient does not need to flow through these parts for this step.
+            head_k_part = current_k_layer[:, :, :initial_keep_len, :].detach()
+            head_v_part = current_v_layer[:, :, :initial_keep_len, :].detach()
             
             segment_end_idx_original = initial_keep_len + segment_len_to_compress
-            tail_k_part = current_k_layer[:, :, segment_end_idx_original:, :]
-            tail_v_part = current_v_layer[:, :, segment_end_idx_original:, :]
+            tail_k_part = current_k_layer[:, :, segment_end_idx_original:, :].detach()
+            tail_v_part = current_v_layer[:, :, segment_end_idx_original:, :].detach()
             
+            # Reconstruct the cache. new_k/v_seg_for_layer are NOT detached and will
+            # carry the gradient into the next LLM forward pass.
             self.key_cache[original_layer_idx] = torch.cat([head_k_part, new_k_seg_for_layer, tail_k_part], dim=-2)
             self.value_cache[original_layer_idx] = torch.cat([head_v_part, new_v_seg_for_layer, tail_v_part], dim=-2)
 
         return actual_compression_performed
 
-    # --- DynamicCache API (与上一版简化版基本一致) ---
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int: # (保持不变)
         if layer_idx is None: layer_idx = 0
         if layer_idx >= len(self.key_cache) or not (self.key_cache[layer_idx].ndim == 4):
